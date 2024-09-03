@@ -1,32 +1,53 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import json
+import seaborn as sns
+import os
 
 class EnhancedMultiNationalEconomicWarRiskModel:
-    def __init__(self, num_countries, num_clusters, initial_conditions, disaster_scenarios):
+    def __init__(self, num_countries, num_clusters, initial_conditions, disaster_scenario, consider_urbanization=True):
         self.num_countries = num_countries
         self.num_clusters = num_clusters
         self.initial_conditions = initial_conditions
-        self.disaster_scenarios = disaster_scenarios
+        self.disaster_scenario = disaster_scenario
+        self.consider_urbanization = consider_urbanization
         
     def initialize_countries(self):
         countries = []
-        base_savings = self.initial_conditions['base_national_savings']
+        base_wealth = self.initial_conditions['base_national_wealth']
         for _ in range(self.num_countries):
             variation = np.random.uniform(-0.3, 0.3)
-            initial_savings = max(base_savings * (1 + variation), 0)
-            clusters = [self.initial_conditions['cluster'].copy() for _ in range(self.num_clusters)]
+            initial_wealth = max(base_wealth * (1 + variation), 0)
+            clusters = []
+            for _ in range(self.num_clusters):
+                cluster = self.initial_conditions['cluster'].copy()
+                cluster['population'] *= np.random.uniform(0.5, 2.0)
+                clusters.append(cluster)
             countries.append({
-                'savings': initial_savings,
+                'wealth': initial_wealth,
                 'clusters': clusters,
-                'active': True
+                'aging_coef':  np.random.uniform(0.3, 1.3), # smaller is aging-resistant society
+                'active': True,
+                'urbanization': 0.3,  # Initial urbanization rate
+                'aging_index': 20  # Initial aging index (elderly per 100 youth)
             })
         return countries
     
-    def cluster_market_oscillation(self, t, cluster):
+    def update_demographics(self, country, t, T):
+        # Simulate urbanization and aging trends to reach max at 1000 steps
+        if self.consider_urbanization:
+            country['urbanization'] = min(1, 0.3 + 0.7 * (t / T))
+        country['aging_index'] = min(200, 20 + 180 * (t / T) * country['aging_coef'])
+        return country
+    
+    def cluster_market_oscillation(self, t, cluster, urbanization, aging_index):
         A0, alpha, omega, phi = cluster['params']
         population = cluster['population']
-        oscillation = max(0, A0 * np.exp(-alpha * t) * np.cos(omega * t + phi) + np.random.normal(0, 0.1))
+        
+        # Adjust oscillation based on demographics
+        aging_factor = 1 - (aging_index - 50) / 200
+        
+        t_mod = t % 60  # Reset every 60 steps = death of a person
+        oscillation = max(0, A0 * (np.cos(omega * t_mod + phi) + 1)  * aging_factor + np.random.normal(0, 0.1))
         return oscillation * population
     
     def calculate_gini_coefficient(self, cluster_assets):
@@ -36,38 +57,57 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         index = np.arange(1, len(cluster_assets) + 1)
         return max(0, (np.sum((2 * index - len(cluster_assets) - 1) * sorted_assets)) / (len(cluster_assets) * np.sum(sorted_assets)))
     
-    def calculate_national_savings(self, cluster_assets, tax_rate):
-        return np.sum(cluster_assets) * tax_rate
+    def calculate_national_wealth(self, cluster_assets, tax_rate, aging_index):
+        # Adjust tax rate based on aging population
+        # Adjust tax rate based on aging population
+        if aging_index <= 20:
+            adjusted_tax_rate = tax_rate * 0.6  # Very low effective tax burden for young societies
+        elif aging_index >= 200:
+            adjusted_tax_rate = tax_rate * 1.3  # High effective tax burden for aged societies
+        else:
+            adjusted_tax_rate = tax_rate * (0.6 + 0.7 * (aging_index - 20) / 180)  # Linear interpolation between young and aged societies
+        return np.sum(cluster_assets) * adjusted_tax_rate
     
-    def apply_civil_unrest_penalty(self, savings, gini_coefficient, threshold=0.8):
-        if gini_coefficient > threshold:
-            penalty = savings * (gini_coefficient - threshold)
-            return max(0, savings - penalty), True
-        return savings, False
+    def apply_civil_unrest_penalty(self, wealth, gini_coefficient, urbanization, threshold=0.8):
+        # Adjust threshold based on urbanization if considered
+        if self.consider_urbanization:
+            adjusted_threshold = threshold - (urbanization - 0.5) * 0.1
+        else:
+            adjusted_threshold = threshold
+        
+        if gini_coefficient > adjusted_threshold:
+            penalty = wealth * (gini_coefficient - adjusted_threshold)
+            return max(0, wealth - penalty), True
+        return wealth, False
     
-    def apply_disaster_penalty(self, savings, scenario):
-        if np.random.random() < scenario['probability']:
-            impact = np.random.uniform(scenario['min_impact'], scenario['max_impact'])
-            return max(0, savings * (1 - impact)), True
-        return savings, False
+    def apply_disaster_penalty(self, wealth):
+        if np.random.random() < self.disaster_scenario['probability']:
+            impact = np.random.uniform(self.disaster_scenario['min_impact'], self.disaster_scenario['max_impact'])
+            return max(0, wealth * (1 - impact)), True
+        return wealth, False
     
-    def calculate_global_war_probability(self, national_savings):
-        active_savings = [s for s in national_savings if s > 0]
-        if len(active_savings) < 2:
+    def calculate_global_war_probability(self, national_wealth, urbanization_rates, aging_indices):
+        active_wealth = [s for s in national_wealth if s > 0]
+        if len(active_wealth) < 2:
             return 0.0
-        total_savings = np.sum(active_savings)
-        normalized_savings = active_savings / total_savings
-        savings_inequality = np.std(normalized_savings)
-        low_savings_countries = np.sum(normalized_savings < 0.5 / len(active_savings))
+        total_wealth = np.sum(active_wealth)
+        normalized_wealth = active_wealth / total_wealth
+        wealth_inequality = np.std(normalized_wealth)
+        low_wealth_countries = np.sum(normalized_wealth < 0.5 / len(active_wealth))
         
         base_probability = 0.01
-        inequality_factor = savings_inequality * 5
-        low_savings_factor = low_savings_countries / len(active_savings)
+        inequality_factor = wealth_inequality * 5
+        low_wealth_factor = low_wealth_countries / len(active_wealth)
         
-        # Adjust probability based on total savings
-        total_savings_factor = 1 / (1 + np.exp(-0.5 * (total_savings - 1000)))  # Sigmoid function
+        # Adjust probability based on total wealth
+        total_wealth_factor = 1 / (1 + np.exp(-0.5 * (total_wealth - 1000)))  # Sigmoid function
         
-        war_probability = (base_probability + inequality_factor + low_savings_factor) * total_savings_factor
+        # Adjust probability based on average urbanization and aging
+        avg_urbanization = np.mean(urbanization_rates)
+        avg_aging_index = np.mean(aging_indices)
+        demographic_factor = 1 + (avg_urbanization - 0.5) * 0.5 - (avg_aging_index - 50) / 200 if self.consider_urbanization else 1 - (avg_aging_index - 50) / 200
+        
+        war_probability = (base_probability + inequality_factor + low_wealth_factor) * total_wealth_factor * demographic_factor
         return min(max(war_probability, 0), 1)
     
     def apply_war_penalties(self, countries):
@@ -76,38 +116,31 @@ class EnhancedMultiNationalEconomicWarRiskModel:
             return countries
 
         # Determine winner and losers
-        winner = max(active_countries, key=lambda x: x['savings'])
+        winner = max(active_countries, key=lambda x: x['wealth'])
         losers = [country for country in active_countries if country != winner]
 
         # Apply penalties
-        winner['savings'] *= 0.8
+        winner['wealth'] *= 0.8
         for cluster in winner['clusters']:
             cluster['params'][0] *= 0.8  # Reduce A0
 
         for loser in losers:
-            loser['savings'] *= 0.4
+            loser['wealth'] *= 0.4
             for cluster in loser['clusters']:
                 cluster['params'][0] *= 0.4  # Reduce A0
 
         return countries
     
-    def apply_innovation_boost(self, countries):
-        for country in countries:
-            if country['active']:
-                for cluster in country['clusters']:
-                    cluster['params'][0] *= 2  # Double A0
-        return countries
-    
-    def simulate(self, T, dt, disaster_scenario):
+    def simulate(self, T, dt):
         time_steps = int(T / dt)
         global_war_probability = np.zeros(time_steps)
-        national_savings = np.zeros((self.num_countries, time_steps))
+        national_wealth = np.zeros((self.num_countries, time_steps))
         gini_coefficients = np.zeros((self.num_countries, time_steps))
-        civil_unrest_events = np.zeros((self.num_countries, time_steps), dtype=bool)
-        disaster_events = np.zeros((self.num_countries, time_steps), dtype=bool)
+        urbanization_rates = np.zeros((self.num_countries, time_steps))
+        aging_indices = np.zeros((self.num_countries, time_steps))
         global_war_events = np.zeros(time_steps, dtype=bool)
-        country_extinctions = np.zeros((self.num_countries, time_steps), dtype=bool)
-        innovation_events = np.zeros(time_steps, dtype=bool)
+        disaster_events = np.zeros((self.num_countries, time_steps), dtype=bool)
+        unrest_events = np.zeros((self.num_countries, time_steps), dtype=bool)
         
         countries = self.initialize_countries()
         
@@ -122,142 +155,166 @@ class EnhancedMultiNationalEconomicWarRiskModel:
                 if not country['active']:
                     continue
                 
-                cluster_assets = np.array([self.cluster_market_oscillation(current_time, cluster) 
+                country = self.update_demographics(country, t, T)
+                
+                cluster_assets = np.array([self.cluster_market_oscillation(current_time, cluster, country['urbanization'], country['aging_index']) 
                                            for cluster in country['clusters']])
                 
                 gini_coefficients[i, t] = self.calculate_gini_coefficient(cluster_assets)
-                new_savings = self.calculate_national_savings(cluster_assets, self.initial_conditions['tax_rate'])
+                new_wealth = self.calculate_national_wealth(cluster_assets, self.initial_conditions['tax_rate'], country['aging_index'])
                 
-                # Adjust national savings based on previous savings and new income
-                country['savings'] = country['savings'] + new_savings
-                country['savings'], civil_unrest_events[i, t] = self.apply_civil_unrest_penalty(country['savings'], gini_coefficients[i, t])
-                country['savings'], disaster_events[i, t] = self.apply_disaster_penalty(country['savings'], disaster_scenario)
+                # Adjust national wealth based on previous wealth and new income
+                country['wealth'] = country['wealth'] + new_wealth
+                country['wealth'], unrest_events[i, t] = self.apply_civil_unrest_penalty(country['wealth'], gini_coefficients[i, t], country['urbanization'])
+                country['wealth'], disaster_events[i, t] = self.apply_disaster_penalty(country['wealth'])
                 
-                national_savings[i, t] = country['savings']
+                national_wealth[i, t] = country['wealth']
+                urbanization_rates[i, t] = country['urbanization']
+                aging_indices[i, t] = country['aging_index']
                 
-                if country['savings'] <= 0:
+                if country['wealth'] <= 0:
                     country['active'] = False
-                    country_extinctions[i, t] = True
             
-            global_war_probability[t] = self.calculate_global_war_probability([country['savings'] for country in active_countries])
+            global_war_probability[t] = self.calculate_global_war_probability([country['wealth'] for country in active_countries],
+                                                                              [country['urbanization'] for country in active_countries],
+                                                                              [country['aging_index'] for country in active_countries])
             
             if global_war_probability[t] == 1:
                 global_war_events[t] = True
                 countries = self.apply_war_penalties(countries)
-                countries = self.apply_innovation_boost(countries)
-                innovation_events[t] = True
         
         return {
             'global_war_probability': global_war_probability,
-            'national_savings': national_savings,
+            'national_wealth': national_wealth,
             'gini_coefficients': gini_coefficients,
-            'civil_unrest_events': civil_unrest_events,
-            'disaster_events': disaster_events,
+            'urbanization_rates': urbanization_rates,
+            'aging_indices': aging_indices,
             'global_war_events': global_war_events,
-            'country_extinctions': country_extinctions,
-            'innovation_events': innovation_events
+            'disaster_events': disaster_events,
+            'unrest_events': unrest_events
         }
 
-    def plot_results(self, results, scenario_name):
-        time_steps = len(results['global_war_probability'])
-        time = np.arange(time_steps)
+def plot_war_probability_comparison(results):
+    plt.figure(figsize=(12, 6))
+    for scenario_name, result in results.items():
+        plt.plot(result['global_war_probability'], label=scenario_name)
+    plt.title('Global War Probability Comparison')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Probability')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('./figs/war_probability_comparison.png')
+    plt.close()
 
-        # Plot global war probability, events, innovations, and extinctions
-        plt.figure(figsize=(12, 6))
-        plt.plot(time, results['global_war_probability'], label='War Probability')
-        plt.scatter(time[results['global_war_events']], 
-                    results['global_war_probability'][results['global_war_events']], 
-                    color='red', label='War Event', zorder=5)
-        plt.scatter(time[results['innovation_events']], 
-                    [0.5] * np.sum(results['innovation_events']), 
-                    color='green', marker='^', label='Innovation Event', zorder=5)
-        
-        # Add extinction events
-        total_extinction = np.all(results['country_extinctions'], axis=0)
-        if np.any(total_extinction):
-            extinction_time = time[total_extinction][0]
-            plt.axvline(x=extinction_time, color='black', linestyle='--', linewidth=2, label='Total Extinction')
-        
-        plt.title(f'Global War Probability, Events, Innovations, and Extinctions Over Time ({scenario_name})')
-        plt.xlabel('Time Steps')
-        plt.ylabel('Probability')
-        plt.ylim(0, 1)
-        plt.legend()
-        plt.grid(True)
-        plt.show()
+def plot_national_wealth_comparison(results):
+    plt.figure(figsize=(12, 6))
+    for scenario_name, result in results.items():
+        avg_wealth = np.mean(result['national_wealth'], axis=0)
+        plt.plot(avg_wealth, label=scenario_name)
+    plt.title('Average National Wealth Comparison')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Average Wealth')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('./figs/national_wealth_comparison.png')
+    plt.close()
 
-        # Plot national savings and country extinctions
-        plt.figure(figsize=(12, 6))
-        for i in range(self.num_countries):
-            plt.plot(time, results['national_savings'][i], label=f'Country {i+1}')
-            extinction_times = time[results['country_extinctions'][i]]
-            plt.scatter(extinction_times, [0] * len(extinction_times), color='black', marker='x', s=100, label='Extinction' if i == 0 else "")
-        
-        # Highlight total extinction
-        if np.any(total_extinction):
-            plt.axvline(x=extinction_time, color='red', linestyle='--', linewidth=2, label='Total Extinction')
-        
-        plt.title(f'National Savings Over Time ({scenario_name})')
-        plt.xlabel('Time Steps')
-        plt.ylabel('Savings')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
+def plot_detailed_events(results):
+    num_scenarios = len(results)
+    num_countries = results[list(results.keys())[0]]['national_wealth'].shape[0]
+    num_steps = results[list(results.keys())[0]]['national_wealth'].shape[1]
 
-        # Plot Gini coefficients
-        plt.figure(figsize=(12, 6))
-        for i in range(self.num_countries):
-            plt.plot(time, results['gini_coefficients'][i], label=f'Country {i+1}')
-        plt.title(f'Gini Coefficients Over Time ({scenario_name})')
-        plt.xlabel('Time Steps')
-        plt.ylabel('Gini Coefficient')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
+    # Create two separate figures for disasters and unrest
+    fig_disasters, ax_disasters = plt.subplots(figsize=(14, 6))
+    fig_unrest, ax_unrest = plt.subplots(figsize=(14, 6))
 
-        # Plot civil unrest and disaster events
-        plt.figure(figsize=(12, 6))
-        for i in range(self.num_countries):
-            country_extinction_time = time[results['country_extinctions'][i]][0] if np.any(results['country_extinctions'][i]) else time[-1]
+    fig_disasters.suptitle('Cumulative Disaster Events by Scenario and Country', fontsize=12)
+    fig_unrest.suptitle('Cumulative Unrest Events by Scenario and Country', fontsize=12)
+
+    colors = plt.cm.get_cmap('tab10')(np.linspace(0, 1, num_scenarios))
+    line_styles = ['-', '--', '-.', ':']
+
+    for i, (scenario_name, result) in enumerate(results.items()):
+        for country in range(num_countries):
+            cumulative_disasters = np.cumsum(result['disaster_events'][country])
+            cumulative_unrest = np.cumsum(result['unrest_events'][country])
             
-            civil_unrest_mask = results['civil_unrest_events'][i] & (time < country_extinction_time)
-            plt.scatter(time[civil_unrest_mask], [i+0.1] * np.sum(civil_unrest_mask), 
-                        label='Civil Unrest' if i == 0 else "", marker='|', color='blue')
+            color = colors[i]
+            line_style = line_styles[country % len(line_styles)]
             
-            disaster_mask = results['disaster_events'][i] & (time < country_extinction_time)
-            plt.scatter(time[disaster_mask], [i-0.1] * np.sum(disaster_mask), 
-                        label='Disaster' if i == 0 else "", marker='|', color='red')
-            
-            plt.scatter(country_extinction_time, i, color='black', marker='x', s=100, label='Extinction' if i == 0 else "")
+            ax_disasters.plot(cumulative_disasters, label=f'{scenario_name} - Country {country+1}', 
+                              linestyle=line_style, color=color)
+            ax_unrest.plot(cumulative_unrest, label=f'{scenario_name} - Country {country+1}', 
+                           linestyle=line_style, color=color)
 
-        plt.title(f'Civil Unrest and Disaster Events Over Time ({scenario_name})')
-        plt.xlabel('Time Steps')
-        plt.ylabel('Countries')
-        plt.yticks(range(self.num_countries), [f'Country {i+1}' for i in range(self.num_countries)])
-        plt.legend()
-        plt.grid(True)
-        plt.show()
+    for ax, event_type in [(ax_disasters, 'Disasters'), (ax_unrest, 'Unrest')]:
+        ax.set_xlabel('Time Steps')
+        ax.set_ylabel('Cumulative Event Count')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+        ax.grid(True)
 
-    def save_results(self, results, filename):
-        with open(filename, 'w') as f:
-            json.dump({k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in results.items()}, f)
+        # Add a text box explaining the line styles
+        line_style_text = '\n'.join([f"Country {i+1}: {style}" for i, style in enumerate(line_styles)])
+        ax.text(1.05, 0.5, f"Line Styles:\n{line_style_text}", transform=ax.transAxes, 
+                bbox=dict(facecolor='white', alpha=0.8), verticalalignment='bottom')
 
-# Usage example
+        # Adjust the plot area to make room for legends
+        box = ax.get_position()
+        ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
+
+    fig_disasters.savefig('./figs/cumulative_disaster_events.png')
+    fig_unrest.savefig('./figs/cumulative_unrest_events.png')
+    plt.close(fig_disasters)
+    plt.close(fig_unrest)
+
+# Run simulations for all scenarios
 initial_conditions = {
-    'base_national_savings': 1000,
-    'cluster': {'params': [1000, 0.1, 1, 0], 'population': 1000000},
+    'base_national_wealth': 1000,
+    'cluster': {'params': [1000, 0.1, 1, 0], 'population': 1000000 },
     'tax_rate': 0.3
 }
 
 disaster_scenarios = {
     'low': {'probability': 0.01, 'min_impact': 0.01, 'max_impact': 0.05},
-    'medium': {'probability': 0.05, 'min_impact': 0.05, 'max_impact': 0.15},
-    'high': {'probability': 0.1, 'min_impact': 0.1, 'max_impact': 0.3}
+    'high': {'probability': 0.07, 'min_impact': 0.05, 'max_impact': 0.3},
+    'veryhigh': {'probability': 0.15, 'min_impact': 0.1, 'max_impact': 0.6}
 }
 
-model = EnhancedMultiNationalEconomicWarRiskModel(num_countries=5, num_clusters=10, initial_conditions=initial_conditions, disaster_scenarios=disaster_scenarios)
+scenarios = [
+    ('Low dis., urbanized', disaster_scenarios['low'], True),
+    ('Low dis., anti-urban', disaster_scenarios['low'], False),
+    ('High dis., urbanized', disaster_scenarios['high'], True),
+    ('High dis., anti-urban', disaster_scenarios['high'], False),
+    ('v-High dis., urbanized', disaster_scenarios['veryhigh'], True),
+    ('v-High dis., anti-urban', disaster_scenarios['veryhigh'], False)
+]
 
-for scenario_name, scenario in disaster_scenarios.items():
-    results = model.simulate(T=100, dt=0.1, disaster_scenario=scenario)
-    model.plot_results(results, scenario_name)
-    model.save_results(results, f'simulation_results_{scenario_name}.json')
+results = {}
+
+for scenario_name, disaster_scenario, consider_urbanization in scenarios:
+    model = EnhancedMultiNationalEconomicWarRiskModel(
+        num_countries=5, 
+        num_clusters=10, 
+        initial_conditions=initial_conditions, 
+        disaster_scenario=disaster_scenario,
+        consider_urbanization=consider_urbanization
+    )
+    results[scenario_name] = model.simulate(T=1000, dt=1)
+
+# Ensure the ./figs directory exists
+# Generate all plots
+plot_war_probability_comparison(results)
+plot_national_wealth_comparison(results)
+plot_detailed_events(results)
+
+# Calculate and print summary statistics
+for scenario_name, result in results.items():
+    print(f"\nScenario: {scenario_name}")
+    print(f"Final war probability: {result['global_war_probability'][-1]:.4f}")
+    print(f"Average war probability: {np.mean(result['global_war_probability']):.4f}")
+    print(f"Total wars: {np.sum(result['global_war_events'])}")
+    print(f"Final average wealth: {np.mean(result['national_wealth'][:, -1]):.2f}")
+    print(f"Overall average wealth: {np.mean(result['national_wealth']):.2f}")
+    print("Aging indices for each country:")
+    for i, country_aging in enumerate(result['aging_indices']):
+        print(f"  Country {i+1}: Initial: {country_aging[0]:.2f}, Final: {country_aging[-1]:.2f}")
