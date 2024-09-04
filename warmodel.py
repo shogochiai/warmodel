@@ -65,7 +65,9 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         self.disaster_scenario = disaster_scenario
         self.aging_scenario = aging_scenario
         self.automation_level = automation_level
-        
+        self.unrest_cooldown = {country: 0 for country in self.country_properties.keys()} 
+        self.productivity_boost_cooldown = {country: 0 for country in self.country_properties.keys()}
+
     def initialize_countries(self):
         countries = []
 
@@ -88,8 +90,18 @@ class EnhancedMultiNationalEconomicWarRiskModel:
                                 (1 + props['urbanization']) * 
                                 (1 - props['aging_index'] / 100) * 
                                 (1 / props['unrest_adjustment']),
+                'birth_rate': self.calculate_initial_birth_rate(props),
+                'death_rate': self.calculate_initial_death_rate(props),
             })
         return countries
+
+    def calculate_initial_birth_rate(self, country_props):
+        # 簡易的な出生率計算（実際のデータに基づいて調整が必要）
+        return 0.02 - 0.01 * (country_props['aging_index'] / 100)  # 2% ~ 1%
+
+    def calculate_initial_death_rate(self, country_props):
+        # 簡易的な死亡率計算（実際のデータに基づいて調整が必要）
+        return 0.007 + 0.003 * (country_props['aging_index'] / 100)  # 0.7% ~ 1%
 
     def create_clusters(self, country_props):
         clusters = []
@@ -134,19 +146,45 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         
         return wealth_distribution
 
+    def update_growth(self, country, t, T):
+        if t % 10 == 0:
+            # Update growth for each cluster
+            for cluster in country['clusters']:
+                # Apply growth rate to cluster wealth
+                net_growth_rate = country['birth_rate'] - country['death_rate']
+                cluster['wealth'] *= (1 + net_growth_rate)
+
+            # Update country's total wealth
+            country['wealth'] = sum(cluster['wealth'] for cluster in country['clusters'])
+            return country
+        else:
+            return country
 
     def update_demographics(self, country, t, T):
-        if country['aging_index'] < 20:
-            # Young countries stay young
-            country['aging_index'] = min(20, country['aging_index'] + 1 * (t / T))
+        # 高齢化と都市化の更新
+        if t % 10 == 0:
+            if country['aging_index'] < 20:
+                country['aging_index'] = min(20, country['aging_index'] + 1 * (t / T))
+            else:
+                if self.aging_scenario == 'moderate':
+                    country['aging_index'] = min(40, country['aging_index'] + (0.3 * 70 * (t / 800) * (1 if np.random.random() < 0.6 else -1)))
+                else:  # rapid aging
+                    country['aging_index'] = min(140, country['aging_index'] + 80 * (t / T))
+            country['urbanization'] = min(1, 0.3 + 0.7 * (t / T))
+
+            # 人口増加の計算
+            net_growth_rate = country['birth_rate'] - country['death_rate']
+            for cluster in country['clusters']:
+                cluster['population'] *= (1 + net_growth_rate)
+            country['population'] = sum(cluster['population'] for cluster in country['clusters'])
+
+            # 出生率と死亡率の動的な更新
+            country['birth_rate'] = max(0.005, country['birth_rate'] - 0.0001 * (t / T))  # 出生率は緩やかに低下
+            country['death_rate'] = min(0.02, country['death_rate'] + 0.00005 * (t / T))  # 死亡率は緩やかに上昇
+
+            return country
         else:
-            # Older countries age gradually
-            if self.aging_scenario == 'moderate':
-                country['aging_index'] = min(100, country['aging_index'] + 40 * (t / T))
-            else:  # rapid aging
-                country['aging_index'] = min(200, country['aging_index'] + 90 * (t / T))
-        country['urbanization'] = min(1, 0.3 + 0.7 * (t / T))
-        return country
+            return country
 
     
     def calculate_gini_coefficient(self, clusters):
@@ -174,21 +212,35 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         gini_coefficient = 1 - 2 * area_under_lorenz
         return gini_coefficient
 
-    
-    def calculate_national_wealth(self, clusters, tax_rate, aging_index):
+        
+    def calculate_national_wealth(self, country, tax_rate):
+        aging_index = country['aging_index']
+        
         if aging_index <= 20:
             adjusted_tax_rate = tax_rate * 0.6
         elif aging_index >= 200:
             adjusted_tax_rate = tax_rate * 1.3
         else:
             adjusted_tax_rate = tax_rate * (0.6 + 0.7 * (aging_index - 20) / 180)
-        return sum(cluster['wealth'] for cluster in clusters) * adjusted_tax_rate
-    
+        
+        total_wealth = sum(cluster['wealth'] for cluster in country['clusters'])
+        tax_collected = total_wealth * adjusted_tax_rate
+        
+        # Deduct taxes from each cluster proportionally
+        for cluster in country['clusters']:
+            cluster_tax = cluster['wealth'] * adjusted_tax_rate
+            cluster['wealth'] -= cluster_tax
+        
+        # Update country's wealth
+        country['wealth'] += tax_collected
+        
+        return country
+
     def calculate_unrest_score(self, country):
         urban_rural_conflict = abs(country['urbanization'] - 0.5)
         education_resentment = country['education_level'] * (1 - country['education_level'])  # Highest at 0.5, lowest at 0 and 1
         elite_surplus = (country['education_level'] - country['wealth'] / country['population']) * 0.1
-        gini_score = country['gini_coefficient'] / (country['wealth'] / country['population'])
+        gini_score = country['gini_coefficient'] * country['population'] / country['wealth'] if country['wealth'] > 0 else 1
         
         # Normalize values to 0-1 range
         urban_rural_conflict = max(min(urban_rural_conflict, 1), 0)
@@ -200,9 +252,18 @@ class EnhancedMultiNationalEconomicWarRiskModel:
     
     
     def check_civil_unrest(self, country):
+        if self.unrest_cooldown[country['name']] > 0:
+            self.unrest_cooldown[country['name']] -= 1
+            return False
+
         unrest_score = self.calculate_unrest_score(country)
-        unrest_probability = max(min(unrest_score * country['unrest_adjustment'], 1), 0)
-        return random.random() < unrest_probability
+        unrest_threshold = 0.7
+        unrest_probability = max(min((unrest_score - unrest_threshold) * country['unrest_adjustment'], 1), 0)
+        
+        if random.random() < unrest_probability:
+            self.unrest_cooldown[country['name']] = 100  # 60-step cooldown period
+            return True
+        return False
     
     def apply_disaster_penalty(self, wealth):
         if np.random.random() < self.disaster_scenario['probability']:
@@ -213,18 +274,27 @@ class EnhancedMultiNationalEconomicWarRiskModel:
     def apply_automation_effects(self, country):
         if self.automation_level == 'low':
             productivity_boost = 1.1
-            inequality_factor = 0.99
+            inequality_change_bad = (1.05, 1.10)
+            inequality_change_good = (0.88, 0.94)
             education_factor = 1.01
         elif self.automation_level == 'medium':
             productivity_boost = 1.3
-            inequality_factor = 1.01
+            inequality_change_bad = (1.07, 1.12)
+            inequality_change_good = (0.86, 0.92)
             education_factor = 1.03
         else:  # high
             productivity_boost = 1.5
-            inequality_factor = 1.04
+            inequality_change_bad = (1.09, 1.14)
+            inequality_change_good = (0.84, 0.90)
             education_factor = 1.05
         
         country['productivity'] *= productivity_boost
+        
+        if random.random() < 0.4:  # 2 in 5 chance
+            inequality_factor = random.uniform(*inequality_change_bad)
+        else:  # 3 in 5 chance
+            inequality_factor = random.uniform(*inequality_change_good)
+        
         country['gini_coefficient'] = min(1, country['gini_coefficient'] * inequality_factor)
         country['education_level'] *= education_factor
         return country
@@ -243,17 +313,46 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         # 2. 全世界の富の大きさ
         poor_nations = [w for w in national_wealth if w < 0.5 * avg_wealth]
         wealth_gap = sum(0.5 * avg_wealth - w for w in poor_nations)
-        # Prevent overflow by clamping the exponent
         exponent = np.clip(0.001 * (total_wealth - wealth_gap), -709, 709)
         global_wealth_factor = 1 / (1 + np.exp(exponent))
         
-        # 戦争リスク計算
-        war_risk = (
-            poor_country_ratio
-        ) * global_wealth_factor
+        # 3. 新しい要因: 教育レベルの差
+        education_disparity = np.std(education_levels) / np.mean(education_levels)
+        
+        # 4. 新しい要因: 高齢化の差
+        aging_disparity = np.std(aging_indices) / np.mean(aging_indices)
+        
+        # 戦争リスク計算（係数を導入）
+        base_risk = (
+            0.1 * poor_country_ratio +
+            0.2 * global_wealth_factor +
+            0.15 * education_disparity +
+            0.15 * aging_disparity
+        )
+        
+        # 調整係数（この値は適切に調整する必要があります）
+        adjustment_factor = 0.01
+        
+        war_risk = 1 - np.exp(-adjustment_factor * base_risk)
         
         return min(max(war_risk, 0), 1)
-    
+
+
+    def apply_productivity_boost(self, country):
+        if self.productivity_boost_cooldown[country['name']] > 0:
+            self.productivity_boost_cooldown[country['name']] -= 1
+            return country, False
+
+        if random.random() < 0.025:  # 1 in 40 chance (on average, once every 40 steps)
+            boost_factor = random.uniform(1.3, 2.0)
+            for cluster in country['clusters']:
+                cluster['wealth'] *= boost_factor
+            country['wealth'] = sum(cluster['wealth'] for cluster in country['clusters'])
+            self.productivity_boost_cooldown[country['name']] = 40  # Set cooldown to 40 steps
+            return country, True
+
+        return country, False
+
     def apply_war_penalties(self, countries):
         active_countries = [country for country in countries if country['active']]
         if len(active_countries) < 2:
@@ -263,19 +362,39 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         losers = [country for country in active_countries if country != winner]
 
         winner['wealth'] *= 0.8
+        winner['birth_rate'] *= 2
+        winner['death_rate'] /= 2
+        winner['aging_index'] = 15  # Reset to a young population
 
         for loser in losers:
             loser['wealth'] *= 0.4
+            loser['birth_rate'] *= 2
+            loser['death_rate'] /= 2
+            loser['aging_index'] = 15  # Reset to a young population
 
         return countries
-    
-    def get_adjusted_clusters(self, country):
-        for i in range(len(country['clusters'])):
-            country['clusters'][i]['wealth'] *= (1 + np.random.normal(0, 0.2))  # Small random fluctuation in wealth
-            country['clusters'][i]['population'] *= (1 + np.random.normal(0, 0.005) - country['aging_index'] * 0.0002)  # Population change considering aging
 
-        country['population'] = sum(cluster['population'] for cluster in country['clusters'])
-        country['wealth'] = sum(cluster['wealth'] for cluster in country['clusters'])
+    def redistribute_wealth_during_unrest(self, country, unrest_impact):
+        total_wealth = sum(cluster['wealth'] for cluster in country['clusters'])
+        total_population = sum(cluster['population'] for cluster in country['clusters'])
+        average_wealth_per_capita = total_wealth / total_population
+
+        # 勝者のクラスターを選択（貧しいクラスターがやや有利）
+        clusters_with_weights = [(cluster, 1 / (cluster['wealth'] + 1)) for cluster in country['clusters']]
+        total_weight = sum(weight for _, weight in clusters_with_weights)
+        normalized_weights = [weight / total_weight for _, weight in clusters_with_weights]
+        winner_cluster = random.choices(country['clusters'], weights=normalized_weights, k=1)[0]
+
+        for cluster in country['clusters']:
+            if cluster == winner_cluster:
+                # 勝者のクラスターは富を増やす
+                cluster['wealth'] *= 1.2
+            else:
+                # 敗者のクラスターは富を減らし、一部を勝者に移転
+                reduction = cluster['wealth'] * 0.3
+                cluster['wealth'] -= reduction
+                winner_cluster['wealth'] += reduction * 0.5  # 減少分の半分を勝者に
+
         return country
 
     def simulate(self, T, dt):
@@ -288,7 +407,9 @@ class EnhancedMultiNationalEconomicWarRiskModel:
         global_war_events = np.zeros(time_steps, dtype=bool)
         disaster_events = np.zeros((self.num_countries, time_steps), dtype=bool)
         unrest_events = np.zeros((self.num_countries, time_steps), dtype=bool)
-        
+        population_data = np.zeros((self.num_countries, time_steps))
+        innovation_events = np.zeros((self.num_countries, time_steps), dtype=bool)
+
         countries = self.initialize_countries()
         
         for t in range(time_steps):
@@ -302,28 +423,33 @@ class EnhancedMultiNationalEconomicWarRiskModel:
                 if not country['active']:
                     continue
                 
+
+
+                country = self.update_growth(country, t, T)
                 country = self.update_demographics(country, t, T)
                 country = self.apply_automation_effects(country)
-                
-                # Update clusters' wealth and population
-                country = self.get_adjusted_clusters(country);
+                country, innovation_occurred = self.apply_productivity_boost(country)
+                if innovation_occurred:
+                    innovation_events[i,t] = True
 
-
-                new_wealth = self.calculate_national_wealth(country['clusters'], self.initial_conditions['tax_rate'], country['aging_index'])
-                country['wealth'] = country['wealth'] + new_wealth
+                country = self.calculate_national_wealth(country, self.initial_conditions['tax_rate'])
                 country['wealth'], disaster_events[i, t] = self.apply_disaster_penalty(country['wealth'])
 
 
                 unrest_events[i, t] = self.check_civil_unrest(country)
                 if unrest_events[i, t]:
-                    country['wealth'] *= np.random.uniform(0.9, 1.0)  # 内乱による経済的損失（ランダムな影響）
-                
+                    unrest_impact = np.random.uniform(0.8, 0.9)  # より小さな経済的損失
+                    country['wealth'] *= unrest_impact
+                    country = self.redistribute_wealth_during_unrest(country, unrest_impact)
+                    country['unrest_adjustment'] *= 0.8  # 内戦後、一時的に不安定性が低下
+
                 national_wealth[i, t] = country['wealth']
                 urbanization_rates[i, t] = country['urbanization']
                 aging_indices[i, t] = country['aging_index']
 
                 gini_coefficients[i, t] = self.calculate_gini_coefficient(country['clusters'])
 
+                population_data[i, t] = country['population'] 
 
                 if country['wealth'] <= 0:
                     country['active'] = False
@@ -346,7 +472,9 @@ class EnhancedMultiNationalEconomicWarRiskModel:
             'aging_indices': aging_indices,
             'global_war_events': global_war_events,
             'disaster_events': disaster_events,
-            'unrest_events': unrest_events
+            'unrest_events': unrest_events,
+            'population_data': population_data,
+            'innovation_events': innovation_events
         }
 
 def run_simulations():
@@ -490,6 +618,23 @@ def plot_results(results):
     plt.savefig('./figs/cumulative_unrest_events.png', bbox_inches='tight')
     plt.close()
 
+
+    # 累積イノベーションイベント数の比較
+    plt.figure(figsize=(15, 8))
+    for scenario_name, result in results.items():
+        disaster, aging, automation = scenario_name.split('_')
+        color = automation_colors[automation]
+        linestyle = get_line_style(disaster, aging, automation)
+        cumulative_innovations = np.sum(result['innovation_events'], axis=0).cumsum()
+        plt.plot(cumulative_innovations, label=create_label(scenario_name), color=color, linestyle=linestyle)
+    plt.title('Cumulative Innovation Events')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Number of Events')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+    plt.tight_layout()
+    plt.savefig('./figs/cumulative_innovation_events.png', bbox_inches='tight')
+    plt.close()
+
     # 平均ジニ係数の比較
     plt.figure(figsize=(15, 8))
     for scenario_name, result in results.items():
@@ -522,22 +667,24 @@ def plot_results(results):
     plt.savefig('./figs/aging_index_comparison.png', bbox_inches='tight')
     plt.close()
 
-
-    # 人口の比較
+    # World Population Comparison
     plt.figure(figsize=(15, 8))
     for scenario_name, result in results.items():
         disaster, aging, automation = scenario_name.split('_')
-        color = aging_colors[aging]
+        color = automation_colors[automation]
         linestyle = get_line_style(disaster, aging, automation)
-        avg_population = np.mean(result['national_wealth'], axis=0) / 1000  # Assuming wealth per capita is 1000
-        plt.plot(avg_population, label=create_label(scenario_name), color=color, linestyle=linestyle)
-    plt.title('Average Population Comparison')
+        world_population = np.sum(result['population_data'], axis=0) / 1e9  # Convert to billions
+        world_population = np.clip(world_population, 0, 10)  # Clip values between 0 and 10 billion
+        plt.plot(world_population, label=create_label(scenario_name), color=color, linestyle=linestyle)
+    plt.title('World Population Comparison')
     plt.xlabel('Time Steps')
-    plt.ylabel('Population (millions)')
+    plt.ylabel('Population (billions)')
+    plt.ylim(0, 10)  # Set y-axis limits from 0 to 10 billion
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
     plt.tight_layout()
-    plt.savefig('./figs/population_comparison.png', bbox_inches='tight')
+    plt.savefig('./figs/world_population_comparison.png', bbox_inches='tight')
     plt.close()
+
 
     print("All plots have been saved in the './figs' directory.")
 
